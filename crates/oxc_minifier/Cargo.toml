@@ -48,4 +48,5 @@ oxc_sourcemap = { workspace = true }
 
 insta = { workspace = true }
 javascript-globals = { workspace = true }
+lazy-regex = { workspace = true }
 pico-args = { workspace = true }
