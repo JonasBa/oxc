@@ -2366,6 +2366,7 @@ dependencies = [
 name = "oxc_minify_napi"
 version = "0.137.0"
 dependencies = [
+ "lazy-regex",
  "mimalloc-safe",
  "napi",
  "napi-build",
@@ -2379,6 +2380,8 @@ dependencies = [
  "oxc_parser",
  "oxc_sourcemap",
  "oxc_span",
+ "oxc_str",
+ "rustc-hash",
 ]
 
 [[package]]
