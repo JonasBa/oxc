@@ -52,10 +52,15 @@ impl Generator for AstBuilderGenerator {
         Ok(())
     }
 
-    /// Generate `AstBuilder`.
-    fn generate(&self, schema: &Schema, _codegen: &Codegen) -> Output {
+    /// Generate `AstBuilder`, plus a mapping from old `AstBuilder` method names to the equivalent
+    /// new builder methods defined on AST types.
+    fn generate_many(&self, schema: &Schema, _codegen: &Codegen) -> Vec<Output> {
         let node_id_cell_type_id =
             schema.type_by_name("NodeId").as_struct().unwrap().containers.cell_id.unwrap();
+
+        // Mapping from old `AstBuilder` method name (e.g. `null_literal`) to the equivalent method
+        // on the AST type (e.g. `NullLiteral::new`). Used to drive migration to the new builder.
+        let mut method_map = vec![];
 
         let fns = schema
             .structs_and_enums()
@@ -67,7 +72,9 @@ impl Generator for AstBuilderGenerator {
                     !enum_def.builder.skip && enum_def.visit.has_visitor()
                 }
             })
-            .map(|type_def| generate_builder_methods(type_def, node_id_cell_type_id, schema))
+            .map(|type_def| {
+                generate_builder_methods(type_def, node_id_cell_type_id, &mut method_map, schema)
+            })
             .collect::<TokenStream>();
 
         let output = quote! {
@@ -97,8 +104,31 @@ impl Generator for AstBuilderGenerator {
             }
         };
 
-        Output::Rust { path: output_path(AST_CRATE_PATH, "ast_builder.rs"), tokens: output }
+        vec![
+            Output::Rust { path: output_path(AST_CRATE_PATH, "ast_builder.rs"), tokens: output },
+            generate_method_map_output(&method_map),
+        ]
     }
+}
+
+/// Generate a JSON file mapping old `AstBuilder` method names to the equivalent new builder methods
+/// defined on AST types.
+///
+/// e.g. `"null_literal": "NullLiteral::new"`, `"alloc_null_literal": "NullLiteral::boxed"`,
+/// `"statement_expression": "Statement::new_expression_statement"`.
+///
+/// Consumed by the `tasks/ast_builder_migration` codemod, which migrates Oxc crates and downstream
+/// consumers from the old `AstBuilder` to the new builder methods.
+fn generate_method_map_output(method_map: &[(String, String)]) -> Output {
+    let mut code = String::from("{\n");
+    for (index, (old_name, new_path)) in method_map.iter().enumerate() {
+        let comma = if index + 1 < method_map.len() { "," } else { "" };
+        #[expect(clippy::format_push_string)]
+        code.push_str(&format!("  \"{old_name}\": \"{new_path}\"{comma}\n"));
+    }
+    code.push_str("}\n");
+
+    Output::Raw { path: "tasks/ast_builder_migration/generated/mappings.json".to_string(), code }
 }
 
 /// Param for a builder function.
@@ -135,14 +165,18 @@ enum GenericType {
 fn generate_builder_methods(
     type_def: StructOrEnum<'_>,
     node_id_cell_type_id: TypeId,
+    method_map: &mut Vec<(String, String)>,
     schema: &Schema,
 ) -> TokenStream {
     match type_def {
-        StructOrEnum::Struct(struct_def) => {
-            generate_builder_methods_for_struct(struct_def, node_id_cell_type_id, schema)
-        }
+        StructOrEnum::Struct(struct_def) => generate_builder_methods_for_struct(
+            struct_def,
+            node_id_cell_type_id,
+            method_map,
+            schema,
+        ),
         StructOrEnum::Enum(enum_def) => {
-            generate_builder_methods_for_enum(enum_def, node_id_cell_type_id, schema)
+            generate_builder_methods_for_enum(enum_def, node_id_cell_type_id, method_map, schema)
         }
     }
 }
@@ -155,6 +189,7 @@ fn generate_builder_methods(
 fn generate_builder_methods_for_struct(
     struct_def: &StructDef,
     node_id_cell_type_id: TypeId,
+    method_map: &mut Vec<(String, String)>,
     schema: &Schema,
 ) -> TokenStream {
     let (mut params, generic_params, where_clause, has_default_fields) =
@@ -174,6 +209,16 @@ fn generate_builder_methods_for_struct(
     } else {
         (String::new(), String::new())
     };
+
+    // Record mappings from old method names to new methods (e.g. `null_literal` -> `NullLiteral::new`).
+    // The boxed (`alloc_*`) method only exists when `Box<T>` appears in the AST.
+    let struct_name = struct_def.name();
+    let snake_name = struct_def.snake_name();
+    let has_box = struct_def.containers.box_id.is_some();
+    push_struct_method_map(method_map, struct_name, &snake_name, "", has_box);
+    if has_default_fields {
+        push_struct_method_map(method_map, struct_name, &snake_name, &fn_name_postfix, has_box);
+    }
 
     // Generate builder functions including all fields (inc default fields)
     let output = generate_builder_methods_for_struct_impl(
@@ -457,6 +502,7 @@ fn get_struct_fn_params_and_fields(
 fn generate_builder_methods_for_enum(
     enum_def: &EnumDef,
     node_id_cell_type_id: TypeId,
+    method_map: &mut Vec<(String, String)>,
     schema: &Schema,
 ) -> TokenStream {
     enum_def
@@ -467,6 +513,7 @@ fn generate_builder_methods_for_enum(
                 enum_def,
                 variant,
                 node_id_cell_type_id,
+                method_map,
                 schema,
             )
         })
@@ -478,6 +525,7 @@ fn generate_builder_method_for_enum_variant(
     enum_def: &EnumDef,
     variant: &VariantDef,
     node_id_cell_type_id: TypeId,
+    method_map: &mut Vec<(String, String)>,
     schema: &Schema,
 ) -> TokenStream {
     let mut variant_type = variant.field_type(schema).unwrap();
@@ -494,6 +542,13 @@ fn generate_builder_method_for_enum_variant(
     let fn_name = enum_variant_builder_name(enum_def, variant);
     let variant_ident = variant.ident();
 
+    // Record mappings from old method names to new methods (e.g. `statement_expression` ->
+    // `Statement::new_expression_statement`). The old name is de-duplicated by
+    // `enum_variant_builder_name`, whereas the new name is always `new_<variant>`.
+    let enum_name = enum_def.name();
+    let new_method_name = format!("new_{}", variant.snake_name());
+    method_map.push((fn_name.clone(), format!("{enum_name}::{new_method_name}")));
+
     let output = has_default_fields.then(|| {
         // Exclude `node_id` from the list of default params (it's always set to `NodeId::DUMMY`)
         let default_params = params.iter().filter(|param| param.is_default && !param.is_node_id);
@@ -503,6 +558,10 @@ fn generate_builder_method_for_enum_variant(
         );
         let doc_postfix =
             format!(" with `{}`", default_params.map(|param| param.field.name()).join("` and `"));
+        method_map.push((
+            format!("{fn_name}{fn_name_postfix}"),
+            format!("{enum_name}::{new_method_name}{fn_name_postfix}"),
+        ));
         generate_builder_method_for_enum_variant_impl(
             enum_def,
             struct_def,
@@ -585,6 +644,31 @@ fn generate_builder_method_for_enum_variant_impl(
         pub fn #fn_name #generic_params(self, #(#fn_params),*) -> #enum_ty #where_clause {
             #enum_ident::#variant_ident(self.#inner_builder_name(#(#args),*))
         }
+    }
+}
+
+/// Record mappings for a struct's builder methods (with the given postfix) into `method_map`.
+///
+/// Maps old `AstBuilder` method names to the equivalent new methods on the AST type,
+/// e.g. `null_literal` -> `NullLiteral::new`, `alloc_null_literal` -> `NullLiteral::boxed`.
+/// The boxed (`alloc_*` / `::boxed`) method only exists when `has_box` is `true`.
+fn push_struct_method_map(
+    method_map: &mut Vec<(String, String)>,
+    struct_name: &str,
+    snake_name: &str,
+    postfix: &str,
+    has_box: bool,
+) {
+    let base = format!("{snake_name}{postfix}");
+    method_map.push((
+        struct_builder_name(&base, false).to_string(),
+        format!("{struct_name}::new{postfix}"),
+    ));
+    if has_box {
+        method_map.push((
+            struct_builder_name(&base, true).to_string(),
+            format!("{struct_name}::boxed{postfix}"),
+        ));
     }
 }
 
